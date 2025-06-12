@@ -1,136 +1,152 @@
 import os
+import re
 import asyncio
-from telegram import Update
+from pytube import YouTube
+from telegram import Update, Document
 from telegram.ext import (
     ApplicationBuilder,
-    ContextTypes,
     CommandHandler,
     MessageHandler,
+    ContextTypes,
     filters,
 )
-import yt_dlp
+from tinydb import TinyDB, Query
 
-TOKEN = os.getenv("TOKEN", "8135426795:AAHsutX7dZX2mIP6dTOz7XeH7bxv8iNN_yM")
-MAX_TG_FILESIZE = 48 * 1024 * 1024  # 48MB
+# --- Persistent User Mode Storage using TinyDB ---
+db = TinyDB('user_modes.json')
+User = Query()
 
-WELCOME_TEXT = (
-    "Hey! 👋\n"
-    "Send me a YouTube link and I'll fetch the video for you.\n"
-    "To get audio only, add 'audio' after the link (e.g. https://youtu.be/xyz audio)\n"
-    "Note: Only files under 50MB can be sent here."
+def set_user_mode(user_id, mode):
+    db.upsert({'user_id': user_id, 'mode': mode}, User.user_id == user_id)
+
+def get_user_mode(user_id):
+    result = db.get(User.user_id == user_id)
+    return result['mode'] if result else 'audio'
+
+# --- YouTube URL extraction ---
+YOUTUBE_REGEX = re.compile(
+    r'(https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)[\w\-]+)'
 )
 
+def extract_youtube_links(text):
+    """
+    Returns a list of all YouTube links found in the given text.
+    """
+    return YOUTUBE_REGEX.findall(text or "")
+
+# --- Downloading functions ---
+async def download_youtube(link, mode):
+    """
+    Download from YouTube in the desired mode (audio, video_360, video_480).
+    Returns the downloaded file's path.
+    """
+    def get_stream():
+        yt = YouTube(link)
+        if mode == 'audio':
+            stream = yt.streams.filter(only_audio=True, file_extension='mp4').first()
+            filename = f"/tmp/{yt.title}.mp3"
+        elif mode == 'video_360':
+            stream = yt.streams.filter(res="360p", progressive=True, file_extension='mp4').first()
+            filename = f"/tmp/{yt.title}_360p.mp4"
+        elif mode == 'video_480':
+            stream = yt.streams.filter(res="480p", progressive=True, file_extension='mp4').first()
+            filename = f"/tmp/{yt.title}_480p.mp4"
+        else:
+            raise Exception("Invalid mode")
+        if not stream:
+            raise Exception(f"No stream found for mode {mode} ({link})")
+        out_file = stream.download(output_path="/tmp")
+        # Convert to mp3 if audio
+        if mode == 'audio':
+            base, _ = os.path.splitext(out_file)
+            os.rename(out_file, filename)
+        else:
+            filename = out_file
+        return filename
+    return await asyncio.to_thread(get_stream)
+
+# --- Command Handlers ---
+async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = update.message.text.lstrip('/').lower()
+    valid_modes = ['audio', 'video_360', 'video_480']
+    if mode in valid_modes:
+        set_user_mode(str(update.effective_user.id), mode)
+        await update.message.reply_text(f"Mode set to {mode}")
+    else:
+        await update.message.reply_text("Invalid mode. Use /audio, /video_360, or /video_480.")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME_TEXT)
+    await update.message.reply_text(
+        "Welcome! Send /audio, /video_360, or /video_480 to set your mode.\n"
+        "Then send YouTube links (plain text or a .txt file with one link per line) and I’ll send you the downloads!"
+    )
 
-def yt_download(url: str) -> str:
-    opts = {
-        "format": "best[ext=mp4][filesize<50M]/best[filesize<50M]/best",
-        "outtmpl": "yt_video.%(ext)s",
-        "noplaylist": True,
-        "quiet": True,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        requested = info.get("requested_downloads")
-        if requested and "filepath" in requested[0]:
-            return requested[0]["filepath"]
-        return ydl.prepare_filename(info)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "1. Set your mode: /audio, /video_360, or /video_480\n"
+        "2. Send YouTube links (plain text or .txt file)\n"
+        "3. I’ll download and send each file. (Max 50MB per file)"
+    )
 
-def yt_download_audio(url: str) -> str:
-    opts = {
-        "format": "bestaudio[filesize<50M]/bestaudio/best",
-        "outtmpl": "yt_audio.%(ext)s",
-        "noplaylist": True,
-        "quiet": True,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        # The output file will be yt_audio.mp3 (or .m4a, etc)
-        # Find the actual file
-        requested = info.get("requested_downloads")
-        if requested and "filepath" in requested[0]:
-            filepath = requested[0]["filepath"]
-            # If postprocessing, change extension to .mp3
-            if filepath.endswith(('.webm', '.m4a', '.opus')):
-                filepath = os.path.splitext(filepath)[0] + ".mp3"
-            return filepath
-        return ydl.prepare_filename(info)
+# --- Main Message Handler ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    mode = get_user_mode(user_id)
+    links = []
 
-async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    parts = text.split()
-    url = parts[0]
-    is_audio = len(parts) > 1 and parts[1].lower() == "audio"
+    # If a .txt document is sent
+    if update.message.document:
+        doc: Document = update.message.document
+        if doc.mime_type == 'text/plain':
+            file = await doc.get_file()
+            file_path = f"/tmp/{doc.file_name}"
+            await file.download_to_drive(file_path)
+            with open(file_path, "r") as f:
+                for line in f:
+                    links += extract_youtube_links(line.strip())
+            os.remove(file_path)
+    else:
+        # Plain text message
+        links = extract_youtube_links(update.message.text or '')
 
-    if not any(x in url for x in ("youtube.com", "youtu.be")):
-        await update.message.reply_text("❌ That's not a valid YouTube link.")
+    if not links:
+        await update.message.reply_text("No YouTube links found in your message or file.")
         return
 
-    await update.message.reply_text(f"⏳ Downloading your {'audio' if is_audio else 'video'}... Please wait.")
+    for link in links:
+        try:
+            await update.message.reply_text(f"Processing: {link}")
+            file_path = await download_youtube(link, mode)
+            # Telegram file size limit for bots is 50MB
+            if os.path.getsize(file_path) > 50*1024*1024:
+                await update.message.reply_text(f"File too large for Telegram: {os.path.basename(file_path)}")
+                os.remove(file_path)
+                continue
+            await update.message.reply_document(open(file_path, "rb"))
+            os.remove(file_path)
+        except Exception as e:
+            await update.message.reply_text(f"Failed for {link}:\n{str(e)}")
 
-    try:
-        if is_audio:
-            filepath = await asyncio.to_thread(yt_download_audio, url)
-            if not os.path.exists(filepath):
-                await update.message.reply_text("⚠️ Couldn't find the downloaded file.")
-                return
+# --- Main Application ---
+def main():
+    BOT_TOKEN = os.environ.get("BOT_TOKEN")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable not set!")
 
-            filesize = os.path.getsize(filepath)
-            if filesize > MAX_TG_FILESIZE:
-                await update.message.reply_text(
-                    "❌ Sorry, the downloaded audio is too large for Telegram (>50MB)."
-                )
-                os.remove(filepath)
-                return
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    for cmd in ['audio', 'video_360', 'video_480']:
+        application.add_handler(CommandHandler(cmd, set_mode))
 
-            with open(filepath, "rb") as audio:
-                await update.message.reply_audio(audio=audio, caption="✅ Here is your audio!")
-            os.remove(filepath)
-        else:
-            filepath = await asyncio.to_thread(yt_download, url)
-            if not os.path.exists(filepath):
-                await update.message.reply_text("⚠️ Couldn't find the downloaded file.")
-                return
+    # Message handler for text and .txt files
+    application.add_handler(MessageHandler(
+        filters.TEXT | filters.Document.FILE_EXTENSION("txt"), handle_message
+    ))
 
-            filesize = os.path.getsize(filepath)
-            if filesize > MAX_TG_FILESIZE:
-                await update.message.reply_text(
-                    "❌ Sorry, the downloaded video is too large for Telegram (>50MB)."
-                )
-                os.remove(filepath)
-                return
-
-            with open(filepath, "rb") as vid:
-                await update.message.reply_video(video=vid, caption="✅ Here you go!")
-            os.remove(filepath)
-    except Exception as e:
-        await update.message.reply_text(
-            f"⚠️ Error: `{e}`", parse_mode="Markdown"
-        )
-
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube))
-    print("Bot started.")
-    await app.run_polling(close_loop=False)
+    application.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    try:
-        asyncio.run(main())
-    except RuntimeError as e:
-        if "already running" in str(e):
-            import nest_asyncio
-            nest_asyncio.apply()
-            loop = asyncio.get_event_loop()
-            loop.create_task(main())
-            loop.run_forever()
-        else:
-            raise
+    main()

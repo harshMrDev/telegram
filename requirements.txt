@@ -1,4 +1,3 @@
-python-telegram-bot==20.6
-yt-dlp
-ffmpeg-python
-nest_asyncio
+python-telegram-bot==20.0
+pytube
+tinydb
