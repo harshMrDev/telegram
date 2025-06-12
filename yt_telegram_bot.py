@@ -142,9 +142,16 @@ def main():
         application.add_handler(CommandHandler(cmd, set_mode))
 
     # Message handler for text and .txt files
-    application.add_handler(MessageHandler(
-        filters.TEXT | filters.Document.FILE_EXTENSION("txt"), handle_message
-    ))
+    from telegram.ext import filters
+
+# ...
+
+    application.add_handler(
+    MessageHandler(
+        filters.TEXT | (filters.Document.MimeType("text/plain")),
+        handle_message
+      )
+   )
 
     application.run_polling()
 
