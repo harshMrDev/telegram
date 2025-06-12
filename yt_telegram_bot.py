@@ -40,6 +40,7 @@ async def download_youtube(link, mode, cookies_file=None):
         ydl_opts = {}
         if mode == 'audio':
             ydl_opts = {
+                'cookiefile': 'cookies.txt',
                 'format': 'bestaudio/best',
                 'outtmpl': outtmpl,
                 'postprocessors': [{
