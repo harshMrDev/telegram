@@ -1,7 +1,7 @@
 import os
 import re
 import asyncio
-from pytube import YouTube
+import yt_dlp
 from telegram import Update, Document
 from telegram.ext import (
     ApplicationBuilder,
@@ -25,7 +25,7 @@ def get_user_mode(user_id):
 
 # --- YouTube URL extraction ---
 YOUTUBE_REGEX = re.compile(
-    r'(https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)[\w\-]+)'
+    r'(https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)[\w\-\_\?&=]+)'
 )
 
 def extract_youtube_links(text):
@@ -34,35 +34,57 @@ def extract_youtube_links(text):
     """
     return YOUTUBE_REGEX.findall(text or "")
 
-# --- Downloading functions ---
+def sanitize_filename(name):
+    # Remove unsupported characters for file names
+    return re.sub(r'[^a-zA-Z0-9_\-\.]', '_', name)
+
+# --- Downloading functions using yt-dlp ---
 async def download_youtube(link, mode):
     """
     Download from YouTube in the desired mode (audio, video_360, video_480).
     Returns the downloaded file's path.
     """
     def get_stream():
-        yt = YouTube(link)
+        outtmpl = "/tmp/%(title).60s.%(ext)s"
         if mode == 'audio':
-            stream = yt.streams.filter(only_audio=True, file_extension='mp4').first()
-            filename = f"/tmp/{yt.title}.mp3"
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': outtmpl,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+                'ffmpeg_location': '/usr/bin/ffmpeg' if os.path.exists('/usr/bin/ffmpeg') else None
+            }
         elif mode == 'video_360':
-            stream = yt.streams.filter(res="360p", progressive=True, file_extension='mp4').first()
-            filename = f"/tmp/{yt.title}_360p.mp4"
+            ydl_opts = {
+                'format': 'bestvideo[height<=360]+bestaudio/best[height<=360]/best[height<=360]',
+                'outtmpl': outtmpl,
+                'merge_output_format': 'mp4',
+                'ffmpeg_location': '/usr/bin/ffmpeg' if os.path.exists('/usr/bin/ffmpeg') else None
+            }
         elif mode == 'video_480':
-            stream = yt.streams.filter(res="480p", progressive=True, file_extension='mp4').first()
-            filename = f"/tmp/{yt.title}_480p.mp4"
+            ydl_opts = {
+                'format': 'bestvideo[height<=480]+bestaudio/best[height<=480]/best[height<=480]',
+                'outtmpl': outtmpl,
+                'merge_output_format': 'mp4',
+                'ffmpeg_location': '/usr/bin/ffmpeg' if os.path.exists('/usr/bin/ffmpeg') else None
+            }
         else:
             raise Exception("Invalid mode")
-        if not stream:
-            raise Exception(f"No stream found for mode {mode} ({link})")
-        out_file = stream.download(output_path="/tmp")
-        # Convert to mp3 if audio
-        if mode == 'audio':
-            base, _ = os.path.splitext(out_file)
-            os.rename(out_file, filename)
-        else:
-            filename = out_file
-        return filename
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(link, download=True)
+            if mode == 'audio':
+                filename = ydl.prepare_filename(info).rsplit('.', 1)[0] + '.mp3'
+            else:
+                ext = 'mp4'
+                filename = ydl.prepare_filename(info).rsplit('.', 1)[0] + f'.{ext}'
+            # Ensure filename is safe
+            safe_filename = '/tmp/' + sanitize_filename(os.path.basename(filename))
+            if filename != safe_filename and os.path.exists(filename):
+                os.rename(filename, safe_filename)
+            return safe_filename if os.path.exists(safe_filename) else filename
     return await asyncio.to_thread(get_stream)
 
 # --- Command Handlers ---
@@ -77,15 +99,19 @@ async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Welcome! Send /audio, /video_360, or /video_480 to set your mode.\n"
-        "Then send YouTube links (plain text or a .txt file with one link per line) and I’ll send you the downloads!"
+        "🎉 *YouTube Downloader Bot*\n\n"
+        "Send `/audio`, `/video_360`, or `/video_480` to set your mode.\n"
+        "Then send YouTube links (plain text or a .txt file with one link per line) and I’ll send you the downloads!\n\n"
+        "*Limits*: Only files up to 50MB can be sent due to Telegram restrictions.",
+        parse_mode="Markdown"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "1. Set your mode: /audio, /video_360, or /video_480\n"
         "2. Send YouTube links (plain text or .txt file)\n"
-        "3. I’ll download and send each file. (Max 50MB per file)"
+        "3. I’ll download and send each file. (Max 50MB per file)",
+        parse_mode="Markdown"
     )
 
 # --- Main Message Handler ---
@@ -117,12 +143,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await update.message.reply_text(f"Processing: {link}")
             file_path = await download_youtube(link, mode)
-            # Telegram file size limit for bots is 50MB
+            if not os.path.isfile(file_path):
+                await update.message.reply_text(f"ERROR: File not found: {file_path}")
+                continue
+            if os.path.getsize(file_path) == 0:
+                await update.message.reply_text(f"ERROR: File is empty: {file_path}")
+                os.remove(file_path)
+                continue
             if os.path.getsize(file_path) > 50*1024*1024:
                 await update.message.reply_text(f"File too large for Telegram: {os.path.basename(file_path)}")
                 os.remove(file_path)
                 continue
-            await update.message.reply_document(open(file_path, "rb"))
+            with open(file_path, "rb") as docf:
+                await update.message.reply_document(document=docf, filename=os.path.basename(file_path))
             os.remove(file_path)
         except Exception as e:
             await update.message.reply_text(f"Failed for {link}:\n{str(e)}")
@@ -142,16 +175,9 @@ def main():
         application.add_handler(CommandHandler(cmd, set_mode))
 
     # Message handler for text and .txt files
-    from telegram.ext import filters
-
-# ...
-
-    application.add_handler(
-    MessageHandler(
-        filters.TEXT | (filters.Document.MimeType("text/plain")),
-        handle_message
-      )
-   )
+    application.add_handler(MessageHandler(
+        filters.TEXT | filters.Document.MimeType("text/plain"), handle_message
+    ))
 
     application.run_polling()
 
