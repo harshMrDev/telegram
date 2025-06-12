@@ -2,6 +2,7 @@ import os
 import re
 import math
 import asyncio
+import traceback
 from datetime import datetime
 import yt_dlp
 from telegram import Update, Document, InlineKeyboardButton, InlineKeyboardMarkup
@@ -40,7 +41,6 @@ async def download_youtube(link, mode, cookies_file=None):
         ydl_opts = {}
         if mode == 'audio':
             ydl_opts = {
-               # 'cookiefile': 'cookies.txt',
                 'format': 'bestaudio/best',
                 'outtmpl': outtmpl,
                 'postprocessors': [{
@@ -63,7 +63,7 @@ async def download_youtube(link, mode, cookies_file=None):
             }
         else:
             raise Exception("Invalid mode")
-        # Add cookies for anti-bot bypass if present
+        # Only use cookies.txt if present
         if cookies_file and os.path.exists(cookies_file):
             ydl_opts['cookiefile'] = cookies_file
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -182,26 +182,26 @@ class SmartFileSplitter:
         return html_content
 
     async def split_and_send(self, file_path, update, context):
+        chat = update.effective_chat
         if not os.path.exists(file_path):
-            await update.message.reply_text("❌ Error: File not found!")
+            await chat.send_message("❌ Error: File not found!")
             return
 
         file_size = os.path.getsize(file_path)
         base_name = os.path.basename(file_path)
         file_name, ext = os.path.splitext(base_name)
 
-        # If file is under 50MB, send directly
         if file_size <= self.max_bytes:
             with open(file_path, 'rb') as f:
-                await update.message.reply_document(
+                await chat.send_document(
                     document=f,
+                    filename=base_name,
                     caption=f"📁 {base_name}\n💾 {file_size / (1024*1024):.1f}MB"
                 )
             return
 
-        # Calculate total parts
         total_parts = math.ceil(file_size / self.max_bytes)
-        status_msg = await update.message.reply_text(
+        status_msg = await chat.send_message(
             f"📁 *Processing:* `{base_name}`\n"
             f"💾 *Size:* `{file_size / (1024*1024):.1f}MB`\n"
             f"📦 *Parts:* `{total_parts}`\n"
@@ -213,18 +213,17 @@ class SmartFileSplitter:
         os.makedirs(parts_dir, exist_ok=True)
 
         try:
-            # First, create and send the merger HTML file
             merger_html = self.create_merger_html(file_name, total_parts, ext)
             merger_path = os.path.join(parts_dir, f"{file_name}_merger.html")
             with open(merger_path, 'w') as f:
                 f.write(merger_html)
             with open(merger_path, 'rb') as f:
-                await update.message.reply_document(
+                await chat.send_document(
                     document=f,
+                    filename=f"{file_name}_merger.html",
                     caption="📝 Step 1: Download this HTML file"
                 )
 
-            # Now split and send the parts
             parts_sent = 0
             with open(file_path, 'rb') as f:
                 for part_num in range(1, total_parts + 1):
@@ -239,8 +238,9 @@ class SmartFileSplitter:
                         part_file.write(chunk)
 
                     with open(part_path, 'rb') as part_file:
-                        await update.message.reply_document(
+                        await chat.send_document(
                             document=part_file,
+                            filename=part_name,
                             caption=f"📦 Step 2: Download Part {part_num}/{total_parts}"
                         )
 
@@ -255,7 +255,7 @@ class SmartFileSplitter:
 
                     os.remove(part_path)
 
-            await update.message.reply_text(
+            await chat.send_message(
                 "📝 *How to get your video:*\n\n"
                 "1️⃣ Download *all* parts and the HTML file\n"
                 "2️⃣ Put them in the *same folder*\n"
@@ -267,8 +267,10 @@ class SmartFileSplitter:
             )
 
         finally:
-            if os.path.exists(parts_dir):
+            try:
                 os.rmdir(parts_dir)
+            except Exception:
+                pass
 
             await status_msg.edit_text(
                 f"✅ *Upload Complete!*\n"
@@ -281,103 +283,135 @@ class SmartFileSplitter:
 
 # --- Telegram logic ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎉 *YouTube Downloader Bot*\n\n"
-        "Send a YouTube link (or a .txt file with links).\n"
-        "I'll ask for Audio/Video and (if video) ask for quality.\n"
-        "*Limits*: Only files up to 50MB can be sent directly. Large files are split and can be merged easily via browser.",
-        parse_mode="Markdown"
-    )
+    try:
+        await update.effective_chat.send_message(
+            "🎉 *YouTube Downloader Bot*\n\n"
+            "Send a YouTube link (or a .txt file with links).\n"
+            "I'll ask for Audio/Video and (if video) ask for quality.\n"
+            "*Limits*: Only files up to 50MB can be sent directly. Large files are split and can be merged easily via browser.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        traceback.print_exc()
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Send a YouTube link (or a .txt file with one link per line).\n"
-        "I'll ask if you want audio or video, then for video: the quality.\n"
-        "Files over 50MB are split into parts and can be merged with an HTML file I provide.",
-        parse_mode="Markdown"
-    )
+    try:
+        await update.effective_chat.send_message(
+            "Send a YouTube link (or a .txt file with one link per line).\n"
+            "I'll ask if you want audio or video, then for video: the quality.\n"
+            "Files over 50MB are split into parts and can be merged with an HTML file I provide.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        traceback.print_exc()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    links = []
-    if update.message.document:
-        doc: Document = update.message.document
-        if doc.mime_type == 'text/plain':
-            file = await doc.get_file()
-            file_path = f"/tmp/{doc.file_name}"
-            await file.download_to_drive(file_path)
-            with open(file_path, "r") as f:
-                for line in f:
-                    links += extract_youtube_links(line.strip())
-            os.remove(file_path)
-    else:
-        links = extract_youtube_links(update.message.text or '')
+    try:
+        links = []
+        if update.message and update.message.document:
+            doc: Document = update.message.document
+            if doc.mime_type == 'text/plain':
+                file = await doc.get_file()
+                file_path = f"/tmp/{doc.file_name}"
+                await file.download_to_drive(file_path)
+                with open(file_path, "r") as f:
+                    for line in f:
+                        links += extract_youtube_links(line.strip())
+                os.remove(file_path)
+        elif update.message:
+            links = extract_youtube_links(update.message.text or '')
 
-    if not links:
-        await update.message.reply_text("No YouTube links found in your message or file.")
-        return
+        if not links:
+            await update.effective_chat.send_message("No YouTube links found in your message or file.")
+            return
 
-    # Store links and step in user_data
-    context.user_data['pending_links'] = links
-    context.user_data['step'] = 'choose_format'
-    keyboard = [
-        [InlineKeyboardButton("🎵 Audio", callback_data='choose_audio'),
-         InlineKeyboardButton("📺 Video", callback_data='choose_video')],
-        [InlineKeyboardButton("❌ Cancel", callback_data='choose_cancel')]
-    ]
-    await update.message.reply_text("Choose format:", reply_markup=InlineKeyboardMarkup(keyboard))
+        context.user_data['pending_links'] = links
+        context.user_data['step'] = 'choose_format'
+        keyboard = [
+            [InlineKeyboardButton("🎵 Audio", callback_data='choose_audio'),
+             InlineKeyboardButton("📺 Video", callback_data='choose_video')],
+            [InlineKeyboardButton("❌ Cancel", callback_data='choose_cancel')]
+        ]
+        await update.effective_chat.send_message(
+            "Choose format:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception:
+        traceback.print_exc()
 
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    step = context.user_data.get('step')
-    links = context.user_data.get('pending_links', [])
+    try:
+        query = update.callback_query
+        await query.answer()
+        step = context.user_data.get('step')
+        links = context.user_data.get('pending_links', [])
 
-    if step == 'choose_format':
-        if query.data == 'choose_audio':
-            context.user_data['chosen_mode'] = 'audio'
-            context.user_data['step'] = None
-            await query.edit_message_text("Downloading audio...")
-            await process_and_send(update, context, links, 'audio')
-            context.user_data.clear()
-        elif query.data == 'choose_video':
-            context.user_data['step'] = 'choose_quality'
-            keyboard = [
-                [InlineKeyboardButton("📺 360p", callback_data='video_360'),
-                 InlineKeyboardButton("📺 480p", callback_data='video_480')],
-                [InlineKeyboardButton("❌ Cancel", callback_data='choose_cancel')]
-            ]
-            await query.edit_message_text("Choose video quality:", reply_markup=InlineKeyboardMarkup(keyboard))
-        elif query.data == 'choose_cancel':
-            await query.edit_message_text("Cancelled.")
-            context.user_data.clear()
-    elif step == 'choose_quality':
-        if query.data in ['video_360', 'video_480']:
-            mode = query.data
-            context.user_data['chosen_mode'] = mode
-            context.user_data['step'] = None
-            await query.edit_message_text(f"Downloading {mode.replace('_', '')} ...")
-            await process_and_send(update, context, links, mode)
-            context.user_data.clear()
-        elif query.data == 'choose_cancel':
-            await query.edit_message_text("Cancelled.")
-            context.user_data.clear()
-    else:
-        await query.edit_message_text("Session expired. Please resend the link.")
+        if step == 'choose_format':
+            if query.data == 'choose_audio':
+                context.user_data['chosen_mode'] = 'audio'
+                context.user_data['step'] = None
+                await query.edit_message_text("Downloading audio...")
+                await process_and_send(update, context, links, 'audio')
+                context.user_data.clear()
+            elif query.data == 'choose_video':
+                context.user_data['step'] = 'choose_quality'
+                keyboard = [
+                    [InlineKeyboardButton("📺 360p", callback_data='video_360'),
+                     InlineKeyboardButton("📺 480p", callback_data='video_480')],
+                    [InlineKeyboardButton("❌ Cancel", callback_data='choose_cancel')]
+                ]
+                await query.edit_message_text("Choose video quality:", reply_markup=InlineKeyboardMarkup(keyboard))
+            elif query.data == 'choose_cancel':
+                await query.edit_message_text("Cancelled.")
+                context.user_data.clear()
+        elif step == 'choose_quality':
+            if query.data in ['video_360', 'video_480']:
+                mode = query.data
+                context.user_data['chosen_mode'] = mode
+                context.user_data['step'] = None
+                await query.edit_message_text(f"Downloading {mode.replace('_', '')} ...")
+                await process_and_send(update, context, links, mode)
+                context.user_data.clear()
+            elif query.data == 'choose_cancel':
+                await query.edit_message_text("Cancelled.")
+                context.user_data.clear()
+        else:
+            await query.edit_message_text("Session expired. Please resend the link.")
+    except Exception:
+        traceback.print_exc()
 
 async def process_and_send(update, context, links, mode):
-    # If you have a cookies.txt, set the path here
     cookies_file = 'cookies.txt' if os.path.exists('cookies.txt') else None
+    chat = update.effective_chat
     for link in links:
         try:
-            msg = await update.effective_chat.send_message(f"🎯 Processing: {link}")
+            msg = await chat.send_message(f"🎯 Processing: {link}")
             file_path = await download_youtube(link, mode, cookies_file)
-            splitter = SmartFileSplitter()
-            await splitter.split_and_send(file_path, update, context)
-            if os.path.exists(file_path):
+            if not os.path.exists(file_path):
+                await chat.send_message("❌ Download failed, file not found!")
+                continue
+            size = os.path.getsize(file_path)
+            if size == 0:
+                await chat.send_message("❌ File is empty. Download failed!")
                 os.remove(file_path)
+                continue
+            if size > 50 * 1024 * 1024:
+                splitter = SmartFileSplitter()
+                await splitter.split_and_send(file_path, update, context)
+            else:
+                with open(file_path, "rb") as docf:
+                    await chat.send_message("📤 Sending file...")
+                    await chat.send_document(
+                        document=docf,
+                        filename=os.path.basename(file_path)
+                    )
+            os.remove(file_path)
             await msg.delete()
         except Exception as e:
-            await update.effective_chat.send_message(f"❌ Failed for {link}:\n`{str(e)}`", parse_mode='Markdown')
+            traceback.print_exc()
+            await chat.send_message(
+                f"❌ Failed for {link}:\n`{str(e)}`", parse_mode='Markdown'
+            )
 
 def main():
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
